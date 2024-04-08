@@ -40,7 +40,7 @@ type traceToMetricConnector struct {
 	// from the agent to OTLP Metrics.
 	translator *metrics.Translator
 
-	resourceAttrs     map[string]string
+	enrichedTags      map[string]string
 	containerTagCache *cache.Cache
 
 	// in specifies the channel through which the agent will output Stats Payloads
@@ -81,7 +81,17 @@ func newTraceToMetricConnector(set component.TelemetrySettings, cfg component.Co
 	for _, val := range cfg.(*Config).Traces.ResourceAttributesAsContainerTags {
 		ctags[val] = ""
 	}
-	ddtags := attributes.ContainerTagFromAttributes(ctags)
+	ddTags := attributes.ContainerTagFromAttributes(ctags)
+
+	for key := range ctags {
+		// TODO: we need to expose the container mappings from the attributes package
+		tags := attributes.ContainerTagFromAttributes(map[string]string{key: ""})
+		// It means there is no mapping for the resource attribute
+		if len(tags) == 0 {
+			ddTags[key] = ""
+		}
+
+	}
 
 	ctx := context.Background()
 	return &traceToMetricConnector{
@@ -90,7 +100,7 @@ func newTraceToMetricConnector(set component.TelemetrySettings, cfg component.Co
 		translator:        trans,
 		in:                in,
 		metricsConsumer:   metricsConsumer,
-		resourceAttrs:     ddtags,
+		enrichedTags:      ddTags,
 		containerTagCache: cache.New(cacheExpiration, cacheCleanupInterval),
 		exit:              make(chan struct{}),
 	}, nil
@@ -146,31 +156,34 @@ func (c *traceToMetricConnector) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: false}
 }
 
+func (c *traceToMetricConnector) addToCache(containerID string, key string) {
+	if tags, ok := c.containerTagCache.Get(containerID); ok {
+		tagList := tags.(*sync.Map)
+		tagList.Store(key, struct{}{})
+	} else {
+		tagList := &sync.Map{}
+		tagList.Store(key, struct{}{})
+		c.containerTagCache.Set(containerID, tagList, cache.DefaultExpiration)
+	}
+}
+
 func (c *traceToMetricConnector) populateContainerTagsCache(traces ptrace.Traces) {
 	for i := 0; i < traces.ResourceSpans().Len(); i++ {
 		rs := traces.ResourceSpans().At(i)
 		attrs := rs.Resource().Attributes()
+
 		containerID, ok := attrs.Get(semconv.AttributeContainerID)
 		if !ok {
 			continue
 		}
 		ddContainerTags := attributes.ContainerTagsFromResourceAttributes(attrs)
-		for attr := range c.resourceAttrs {
+		for attr := range c.enrichedTags {
 			if val, ok := ddContainerTags[attr]; ok {
 				key := fmt.Sprintf("%s:%s", attr, val)
-				if v, ok := c.containerTagCache.Get(containerID.AsString()); ok {
-					cacheVal := v.(*sync.Map)
-					// check if the key already exists in the cache
-					if _, ok := cacheVal.Load(key); ok {
-						continue
-					}
-					cacheVal.Store(key, struct{}{})
-				} else {
-					cacheVal := &sync.Map{}
-					cacheVal.Store(key, struct{}{})
-					c.containerTagCache.Set(containerID.AsString(), cacheVal, cache.DefaultExpiration)
-				}
-
+				c.addToCache(containerID.AsString(), key)
+			} else if incomingVal, ok := attrs.Get(attr); ok {
+				key := fmt.Sprintf("%s:%s", attr, incomingVal.Str())
+				c.addToCache(containerID.AsString(), key)
 			}
 		}
 	}
@@ -214,7 +227,7 @@ func (c *traceToMetricConnector) run() {
 			var mx pmetric.Metrics
 			var err error
 			// Enrich the stats with container tags
-			if len(c.resourceAttrs) > 0 {
+			if len(c.enrichedTags) > 0 {
 				c.enrichStatsPayload(stats)
 			}
 
